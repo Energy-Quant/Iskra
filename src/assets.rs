@@ -43,6 +43,9 @@ pub const V2_LOGICAL_W: u32 = 160;
 pub const V2_LOGICAL_H: u32 = 160;
 pub const V2_PROFILE: &str = "iskra-v6";
 pub const V2_FRAMES_PER_ANIM: usize = 8;
+/// Smooth (interpolated) packs double the frames at half frame_ms; the
+/// player is count-agnostic, so both densities are valid V2.
+pub const V2_FRAMES_PER_ANIM_SMOOTH: usize = 16;
 pub const V2_MIN_FRAME_MS: u64 = 30;
 pub const V2_MAX_FRAME_MS: u64 = 2000;
 
@@ -161,9 +164,9 @@ fn parse_v2_entry(name: &str, a: &Value) -> Result<ManifestEntry, String> {
         .ok_or_else(|| format!("'{name}': missing frames"))?;
     // Raw length first: a non-string element must not be silently
     // dropped into an apparently-correct count.
-    if raw.len() != V2_FRAMES_PER_ANIM {
+    if raw.len() != V2_FRAMES_PER_ANIM && raw.len() != V2_FRAMES_PER_ANIM_SMOOTH {
         return Err(format!(
-            "'{name}' needs exactly {V2_FRAMES_PER_ANIM} frames, got {}",
+            "'{name}' needs {V2_FRAMES_PER_ANIM} or {V2_FRAMES_PER_ANIM_SMOOTH} frames, got {}",
             raw.len()
         ));
     }
@@ -517,23 +520,23 @@ fn load_animation(
     })
 }
 
-/// V2 animation: exactly 8 RGBA 256x256 frames, bilinear upscale to the
-/// 160x160 logical surface, per-animation contact normalized.
+/// V2 animation: 8 (or 16 smooth) RGBA 256x256 frames, bilinear upscale
+/// to the 160x160 logical surface, per-animation contact normalized.
 fn load_animation_v2(
     root: &Path,
     name: &str,
     entry: &ManifestEntry,
     scale: u32,
 ) -> Result<Animation, String> {
-    if entry.frames.len() != V2_FRAMES_PER_ANIM {
+    if entry.frames.len() != V2_FRAMES_PER_ANIM && entry.frames.len() != V2_FRAMES_PER_ANIM_SMOOTH {
         return Err(format!(
-            "'{name}' needs exactly {V2_FRAMES_PER_ANIM} frames, got {}",
+            "'{name}' needs {V2_FRAMES_PER_ANIM} or {V2_FRAMES_PER_ANIM_SMOOTH} frames, got {}",
             entry.frames.len()
         ));
     }
     let out_w = V2_LOGICAL_W as i32 * scale as i32;
     let out_h = V2_LOGICAL_H as i32 * scale as i32;
-    let mut frames = Vec::with_capacity(V2_FRAMES_PER_ANIM);
+    let mut frames = Vec::with_capacity(entry.frames.len());
     let mut ub: Option<(i32, i32, i32, i32)> = None;
     for rel in &entry.frames {
         let path =
