@@ -78,12 +78,11 @@ jobs:
           tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP/actionlint"
           "$RUNNER_TEMP/actionlint/actionlint" .github/workflows/*.yml
 
-      - name: Check Plugin And Packaging
+      - name: Check Plugin And Scripts
         run: |
           lua5.4 plugin/iskra/tests/model_test.lua
           lua5.4 plugin/iskra/tests/i18n_test.lua
           python3 plugin/iskra/tests/locales_test.py
-          python3 -m unittest discover -s scripts/tests -p 'test_*.py'
           shellcheck scripts/*.sh
 
       - name: Stage Unsigned Plugin And Parse Luau
@@ -210,6 +209,9 @@ jobs:
 
       - name: Fetch Locked Rust Dependencies
         run: cargo fetch --locked
+
+      - name: Check Packaging And Delivery Scripts
+        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 
       - name: Build Desktop Companion Without Launching
         run: |
