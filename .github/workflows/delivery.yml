@@ -22,7 +22,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   deliver:
-    if: github.repository == 'Energy-Quant/Iskra' && github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' || (vars.ISKRA_RELEASE_APP_ID != '' && github.event_name == 'schedule') || (vars.ISKRA_RELEASE_APP_ID != '' && github.event.workflow_run.conclusion == 'success' && contains(fromJSON('["main","dev"]'), github.event.workflow_run.head_branch) && contains(fromJSON('["push","workflow_dispatch"]'), github.event.workflow_run.event)))
+    if: github.repository == 'Energy-Quant/Iskra' && github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' || (vars.ISKRA_RELEASE_APP_ID != '' && github.event_name == 'schedule') || (vars.ISKRA_RELEASE_APP_ID != '' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository && contains(fromJSON('["main","dev"]'), github.event.workflow_run.head_branch) && contains(fromJSON('["push","workflow_dispatch"]'), github.event.workflow_run.event)))
     runs-on: ubuntu-24.04
     environment: ${{ github.event_name == 'workflow_dispatch' && inputs.operation == 'publish' && 'stable-release' || 'release' }}
     steps:
@@ -44,7 +44,7 @@ jobs:
           owner: ${{ github.repository_owner }}
           repositories: Iskra
           permission-contents: write
-          permission-actions: write
+          permission-actions: read
           permission-workflows: write
       - name: Verify and deliver
         env:

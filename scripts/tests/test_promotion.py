@@ -2,6 +2,7 @@
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
 import unittest
 from unittest.mock import call, patch
 
@@ -86,6 +87,20 @@ class PromotionTests(unittest.TestCase):
         self.assertEqual(gh.call_args_list, [
             call('api', 'repos/Energy-Quant/Iskra/pulls/7/merge', '--method', 'PUT',
                  '-f', 'merge_method=merge', '-f', 'sha=' + self.head),
+            call('api', 'repos/Energy-Quant/Iskra/git/refs/heads/dev', '--method', 'PATCH',
+                 '-f', 'sha=' + 'f' * 40, '-F', 'force=false')])
+
+    def test_fast_forward_conflict_falls_back_to_merge(self):
+        api_patch, all_patch, run_patch, gh_patch = self.fixture()
+        with api_patch, all_patch, run_patch, gh_patch as gh:
+            gh.side_effect = [json.dumps({'merged': True, 'sha': 'f' * 40}),
+                              subprocess.CalledProcessError(1, ['gh']), '{}']
+            self.promote.promote(False)
+        self.assertEqual(gh.call_args_list, [
+            call('api', 'repos/Energy-Quant/Iskra/pulls/7/merge', '--method', 'PUT',
+                 '-f', 'merge_method=merge', '-f', 'sha=' + self.head),
+            call('api', 'repos/Energy-Quant/Iskra/git/refs/heads/dev', '--method', 'PATCH',
+                 '-f', 'sha=' + 'f' * 40, '-F', 'force=false'),
             call('api', 'repos/Energy-Quant/Iskra/merges', '--method', 'POST',
                  '-f', 'base=dev', '-f', 'head=main',
                  '-f', 'commit_message=Sync promoted main into dev')])
