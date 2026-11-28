@@ -1,10 +1,16 @@
 //! Windows monitor/fullscreen probe producing the same `HyprEvent` stream
 //! as the hyprctl poller on Wayland. Each monitor is its own "workspace"
 //! (id = index) so a fullscreen window only hides the pet on its output.
-//! A window counts as fullscreen when its rect covers a monitor's full
-//! `rcMonitor` and it is not maximized (`IsZoomed`) — a maximized window
-//! leaves the taskbar strip and must not hide the pet, matching the
-//! Wayland eFullscreenState semantics (1 = maximized, >=2 = fullscreen).
+//! A monitor counts as fullscreen when the topmost visible window in
+//! z-order intersecting it covers its full `rcMonitor` and is not maximized
+//! (`IsZoomed`). The z-order test is what keeps transparent always-visible
+//! shell layers (TextInputHost's screen-spanning input window, shell
+//! surfaces) from permanently hiding the pet: they sit below every real
+//! window, so they only decide the outcome when the desktop is genuinely
+//! empty — and then they do not cover the monitor anyway. A maximized
+//! window is never fullscreen, matching the Wayland eFullscreenState
+//! semantics (1 = maximized, >=2 = fullscreen); the failure direction is
+//! fail-open (pet stays visible) rather than fail-closed.
 //!
 //! Coordinates are physical pixels; the process is made DPI-aware by
 //! `desktop_win::run` before the poller starts.
@@ -23,8 +29,8 @@ use windows_sys::Win32::Graphics::Gdi::{
     MONITOR_DEFAULTTONEAREST,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId,
-    IsIconic, IsWindowVisible, IsZoomed,
+    GetClassNameW, GetForegroundWindow, GetTopWindow, GetWindow, GetWindowRect,
+    GetWindowThreadProcessId, IsIconic, IsWindowVisible, IsZoomed, GW_HWNDNEXT,
 };
 
 const POLL_INTERVAL: std::time::Duration = crate::hyprland::POLL_INTERVAL;
@@ -117,50 +123,78 @@ fn window_class(hwnd: HWND) -> String {
     String::from_utf16_lossy(&buf[..n as usize])
 }
 
-struct EnumCtx {
-    pid: u32,
-    monitors: Vec<RECT>,
-    /// Per monitor index: a covering non-maximized window was found.
-    fullscreen_on: Vec<bool>,
+/// A visible top-level window that survived the shell/own-pid denylist,
+/// in z-order (top first) as returned by the `GetTopWindow`/`GW_HWNDNEXT`
+/// walk — the only z-order enumeration with documented ordering.
+struct ZWindow {
+    rect: RECT,
+    zoomed: bool,
 }
 
-unsafe extern "system" fn enum_windows_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    let ctx = &mut *(lparam as *mut EnumCtx);
-    if IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 || IsZoomed(hwnd) != 0 {
-        return TRUE;
-    }
-    let mut pid = 0u32;
-    GetWindowThreadProcessId(hwnd, &mut pid);
-    if pid == ctx.pid {
-        return TRUE; // our own pet/HUD windows
-    }
-    let cls = window_class(hwnd);
-    if NOT_FULLSCREEN_CLASSES.iter().any(|c| *c == cls) {
-        return TRUE;
-    }
-    let mut rc: RECT = std::mem::zeroed();
-    if GetWindowRect(hwnd, &mut rc) == 0 {
-        return TRUE;
-    }
-    for (i, mon) in ctx.monitors.iter().enumerate() {
-        if rect_covers(&rc, mon) {
-            ctx.fullscreen_on[i] = true;
+fn rects_intersect(a: &RECT, b: &RECT) -> bool {
+    a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top
+}
+
+/// Per monitor: the first z-order window intersecting it decides — the
+/// monitor is fullscreen exactly when that window covers it and is not
+/// maximized. Shell input layers below every real window never decide
+/// unless the desktop is empty, where they do not decide for fullscreen.
+fn decide_fullscreen(monitors: &[RECT], zordered: &[ZWindow]) -> Vec<bool> {
+    let mut out = vec![false; monitors.len()];
+    let mut decided = vec![false; monitors.len()];
+    for w in zordered {
+        for (i, mon) in monitors.iter().enumerate() {
+            if decided[i] || !rects_intersect(&w.rect, mon) {
+                continue;
+            }
+            decided[i] = true;
+            out[i] = !w.zoomed && rect_covers(&w.rect, mon);
+        }
+        if decided.iter().all(|d| *d) {
+            break;
         }
     }
-    TRUE
+    out
+}
+
+/// Visible non-iconic top-level windows in documented z-order, minus our
+/// own pet/HUD windows and the shell surfaces in the denylist.
+fn collect_windows_zorder() -> Vec<ZWindow> {
+    let own = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcessId() };
+    let mut out = Vec::new();
+    let mut hwnd = unsafe { GetTopWindow(std::ptr::null_mut()) };
+    let mut guard = 0;
+    while !hwnd.is_null() && guard < 1024 {
+        guard += 1;
+        let visible = unsafe { IsWindowVisible(hwnd) } != 0;
+        let iconic = unsafe { IsIconic(hwnd) } != 0;
+        if visible && !iconic {
+            let mut pid = 0u32;
+            unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+            if pid != own {
+                let cls = window_class(hwnd);
+                if !NOT_FULLSCREEN_CLASSES.iter().any(|c| *c == cls) {
+                    let mut rc: RECT = unsafe { std::mem::zeroed() };
+                    if unsafe { GetWindowRect(hwnd, &mut rc) } != 0 {
+                        out.push(ZWindow {
+                            rect: rc,
+                            zoomed: unsafe { IsZoomed(hwnd) } != 0,
+                        });
+                    }
+                }
+            }
+        }
+        hwnd = unsafe { GetWindow(hwnd, GW_HWNDNEXT) };
+    }
+    out
 }
 
 /// One probe: monitor list plus fullscreen occupancy per monitor index.
 fn probe() -> Result<(Vec<MonitorInfo>, Vec<ClientInfo>), String> {
     let raws = collect_monitors()?;
-    let mut ctx = EnumCtx {
-        pid: unsafe { windows_sys::Win32::System::Threading::GetCurrentProcessId() },
-        monitors: raws.iter().map(|m| m.rect).collect(),
-        fullscreen_on: vec![false; raws.len()],
-    };
-    unsafe {
-        EnumWindows(Some(enum_windows_cb), &mut ctx as *mut _ as LPARAM);
-    }
+    let zordered = collect_windows_zorder();
+    let fullscreen_on =
+        decide_fullscreen(&raws.iter().map(|m| m.rect).collect::<Vec<_>>(), &zordered);
     let fg = unsafe { GetForegroundWindow() };
     let fg_mon = if fg.is_null() {
         std::ptr::null_mut()
@@ -194,8 +228,7 @@ fn probe() -> Result<(Vec<MonitorInfo>, Vec<ClientInfo>), String> {
             special_workspace: None,
         })
         .collect();
-    let clients: Vec<ClientInfo> = ctx
-        .fullscreen_on
+    let clients: Vec<ClientInfo> = fullscreen_on
         .iter()
         .enumerate()
         .filter(|(_, on)| **on)
@@ -232,4 +265,66 @@ pub fn spawn_poller(tx: mpsc::Sender<HyprEvent>, stop: Arc<AtomicBool>) -> threa
             }
         })
         .expect("spawn winmon poller")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rc(l: i32, t: i32, r: i32, b: i32) -> RECT {
+        RECT {
+            left: l,
+            top: t,
+            right: r,
+            bottom: b,
+        }
+    }
+
+    fn zw(rect: RECT, zoomed: bool) -> ZWindow {
+        ZWindow { rect, zoomed }
+    }
+
+    fn two_monitors() -> Vec<RECT> {
+        vec![rc(0, 0, 1600, 900), rc(1600, 0, 3520, 1080)]
+    }
+
+    #[test]
+    fn shell_input_layer_below_real_window_is_not_fullscreen() {
+        // TextInputHost covers monitor 1 exactly but sits below the IDE;
+        // the IDE decides the monitor and does not cover it.
+        let z = vec![
+            zw(rc(100, 100, 900, 700), false),
+            zw(rc(0, 0, 1600, 900), false),
+        ];
+        assert_eq!(decide_fullscreen(&two_monitors(), &z), vec![false, false]);
+    }
+
+    #[test]
+    fn covering_window_on_top_is_fullscreen() {
+        let z = vec![zw(rc(0, 0, 1600, 900), false)];
+        assert_eq!(decide_fullscreen(&two_monitors(), &z), vec![true, false]);
+    }
+
+    #[test]
+    fn maximized_covering_window_is_not_fullscreen() {
+        // Auto-hidden taskbar: a maximized window can cover rcMonitor fully.
+        let z = vec![zw(rc(0, 0, 1600, 900), true)];
+        assert_eq!(decide_fullscreen(&two_monitors(), &z), vec![false, false]);
+    }
+
+    #[test]
+    fn fullscreen_decision_is_per_monitor() {
+        // Borderless video covering monitor 2 while a small window floats
+        // on monitor 1: only monitor 2 is fullscreen.
+        let z = vec![
+            zw(rc(200, 200, 700, 500), false),
+            zw(rc(1600, 0, 3520, 1080), false),
+        ];
+        assert_eq!(decide_fullscreen(&two_monitors(), &z), vec![false, true]);
+    }
+
+    #[test]
+    fn empty_desktop_is_not_fullscreen() {
+        assert_eq!(decide_fullscreen(&two_monitors(), &[]), vec![false, false]);
+    }
 }

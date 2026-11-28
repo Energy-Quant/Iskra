@@ -18,6 +18,10 @@ path = "src/main.rs"
 name = "zeron-pet-prepare-assets"
 path = "src/bin/prepare_assets.rs"
 
+[[bin]]
+name = "zeron-pet-devin-mcp"
+path = "src/bin/devin_mcp.rs"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
