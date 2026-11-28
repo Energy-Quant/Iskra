@@ -117,9 +117,9 @@ pub(crate) const HUD_OFFSET_Y: i32 = 16;
 /// badge frame is not clipped by the layer surface.
 pub(crate) const HUD_SHADOW_PAD: i32 = 4;
 
-pub(crate) const TICK: Duration = Duration::from_millis(60);
+pub(crate) const TICK: Duration = Duration::from_millis(16);
 
-pub(crate) const ASSET_POLL_EVERY: u32 = 34; // ~2s at 60ms
+pub(crate) const ASSET_POLL_EVERY: u32 = 125; // ~2s at 16ms
 
 pub(crate) const CYCLE_EVERY: Duration = Duration::from_secs(5);
 
