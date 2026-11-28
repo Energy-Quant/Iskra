@@ -36,7 +36,7 @@ def green_gate(run, jobs):
 
 
 def run_gh(*args):
-    subprocess.run(['gh', *args], check=True)
+    subprocess.run(['gh', *args], check=True, timeout=300)
 
 
 def promote(resume):
@@ -87,9 +87,16 @@ def promote(resume):
                                     '-f', 'merge_method=merge', '-f', f'sha={dev}'))
     if not result.get('merged'):
         raise ValueError('GitHub did not merge the promotion PR')
-    print('Promoted main:', result['sha'])
-    delivery.gh('api', repo + '/merges', '--method', 'POST', '-f', 'base=dev', '-f', 'head=main',
-                '-f', 'commit_message=Sync promoted main into dev')
+    promoted = result['sha']
+    print('Promoted main:', promoted)
+    try:
+        delivery.gh('api', repo + '/git/refs/heads/dev', '--method', 'PATCH',
+                    '-f', f'sha={promoted}', '-F', 'force=false')
+        print('Fast-forwarded dev to promoted main:', promoted)
+    except subprocess.CalledProcessError:
+        delivery.gh('api', repo + '/merges', '--method', 'POST', '-f', 'base=dev', '-f', 'head=main',
+                    '-f', 'commit_message=Sync promoted main into dev')
+        print('Merged promoted main into dev after concurrent dev advance.')
 
 
 if __name__ == '__main__':

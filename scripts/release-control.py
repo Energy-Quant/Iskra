@@ -84,13 +84,19 @@ def main():
     current = api(f'repos/{REPO}/git/ref/heads/{branch}')['object']['sha']
     if current != run['head_sha']:
         raise ValueError('branch advanced; run CI again on the current commit')
+    if args.operation == 'nightly':
+        main_sha = api(f'repos/{REPO}/git/ref/heads/main')['object']['sha']
+        if current == main_sha:
+            print('Current dev matches promoted main; skipping duplicate nightly.')
+            return
     recent = api_all(f'repos/{REPO}/actions/workflows/ci.yml/runs?branch={branch}&per_page=100', 'workflow_runs')
     latest = next((r for r in recent if r['head_sha'] == current and r['event'] in ('push', 'workflow_dispatch')), None)
     if latest is None or latest['id'] != args.run or latest['conclusion'] != 'success':
         raise ValueError('only the latest exact-SHA source CI is eligible; an older green run is insufficient')
 
-    jobs = api_all(f'repos/{REPO}/actions/runs/{args.run}/jobs?per_page=100', 'jobs')
-    if not any(j['name'] == 'CI Gate' and j['conclusion'] == 'success' for j in jobs):
+    attempt = run.get('run_attempt', 1)
+    jobs = api_all(f'repos/{REPO}/actions/runs/{args.run}/attempts/{attempt}/jobs?per_page=100', 'jobs')
+    if not any(j['name'] == 'CI Gate' and j['conclusion'] == 'success' and j['head_sha'] == run['head_sha'] for j in jobs):
         raise ValueError('the required aggregate CI Gate did not succeed')
     with tempfile.TemporaryDirectory(prefix='iskra-delivery-') as temp:
         root = Path(temp)

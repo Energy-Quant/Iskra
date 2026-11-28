@@ -3,9 +3,12 @@
 The authoritative pipeline is .github/workflows/ci.yml, with reusable Linux
 checks in linux.yml and privileged delivery in delivery.yml.
 
-- Linux: Rust 1.96.0, locked tests, fmt, clippy, RustSec audit, pinned
-  layer-shell/Luau source builds, Lua/i18n, installer/packaging/Ed25519 tests,
-  shellcheck and actionlint. Runtime applications are never launched.
+- Linux lanes run in parallel: Rust 1.96.0 locked tests/fmt/clippy, native
+  packaging, Lua/i18n/installer/packaging/Ed25519 script checks, and a standalone
+  SHA256-verified RustSec audit. Luau source builds and actionlint are pinned;
+  runtime applications are never launched.
+- An exact fast-forward synchronization push that already matches main skips
+  duplicate dev build lanes; the branch-policy gate still runs.
 - Windows/macOS/Linux: Python 3.12 and Pillow 13.0.0, avatar/portable tests,
   unsigned plugin staging ZIPs and avatar authoring toolkits.
 - CI Gate: every required dependency must succeed. A skipped, cancelled or

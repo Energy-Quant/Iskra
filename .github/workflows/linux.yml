@@ -4,17 +4,113 @@ on:
 permissions:
   contents: read
 jobs:
-  linux:
-    name: Linux desktop
+  rust-audit:
+    name: RustSec audit
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 10
+    env:
+      CARGO_AUDIT_VERSION: "0.23.0"
+      CARGO_AUDIT_SHA256: "4f01c74ed84b2dffd0b1d37012a62cdf2a92c96e25bdf8eec7fcc0d4d3eb7811"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check Out Sources
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Run RustSec Audit
+        run: |
+          curl --fail --location --retry 3 \
+            "https://github.com/rustsec/rustsec/releases/download/cargo-audit/v${CARGO_AUDIT_VERSION}/cargo-audit-x86_64-unknown-linux-musl-v${CARGO_AUDIT_VERSION}.tgz" \
+            -o "$RUNNER_TEMP/cargo-audit.tgz"
+          echo "${CARGO_AUDIT_SHA256}  $RUNNER_TEMP/cargo-audit.tgz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/cargo-audit"
+          tar -xzf "$RUNNER_TEMP/cargo-audit.tgz" -C "$RUNNER_TEMP/cargo-audit"
+          "$RUNNER_TEMP/cargo-audit/cargo-audit-x86_64-unknown-linux-musl-v${CARGO_AUDIT_VERSION}/cargo-audit" audit --deny warnings
+
+  plugin-checks:
+    name: Linux plugin and scripts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      SOURCE_DATE_EPOCH: "946684800"
+      LUAU_COMMIT: 12a6ba75883272c79b66b59815efef4c574196f6
+      ACTIONLINT_VERSION: "1.7.7"
+      ACTIONLINT_SHA256: "023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check Out Sources
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential cmake curl lua5.4 python3 python3-pil shellcheck
+
+      - name: Build Pinned Luau Compiler
+        run: |
+          source_dir="$RUNNER_TEMP/iskra-luau"
+          mkdir -p "$source_dir"
+          curl --fail --location --retry 3 \
+            "https://github.com/luau-lang/luau/archive/$LUAU_COMMIT.tar.gz" \
+            -o "$RUNNER_TEMP/iskra-luau.tar.gz"
+          tar -xzf "$RUNNER_TEMP/iskra-luau.tar.gz" \
+            --strip-components=1 -C "$source_dir"
+          cmake -S "$source_dir" -B "$source_dir/build" \
+            -DCMAKE_BUILD_TYPE=Release -DLUAU_BUILD_TESTS=OFF -DLUAU_BUILD_WEB=OFF
+          cmake --build "$source_dir/build" --target Luau.Compile.CLI --parallel "$(nproc)"
+          echo "$source_dir/build" >> "$GITHUB_PATH"
+
+      - name: Check Workflow Syntax
+        run: |
+          curl --fail --location --retry 3 \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
+            -o "$RUNNER_TEMP/actionlint.tar.gz"
+          echo "${ACTIONLINT_SHA256}  $RUNNER_TEMP/actionlint.tar.gz" | sha256sum -c -
+          mkdir "$RUNNER_TEMP/actionlint"
+          tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP/actionlint"
+          "$RUNNER_TEMP/actionlint/actionlint" .github/workflows/*.yml
+
+      - name: Check Plugin And Packaging
+        run: |
+          lua5.4 plugin/iskra/tests/model_test.lua
+          lua5.4 plugin/iskra/tests/i18n_test.lua
+          python3 plugin/iskra/tests/locales_test.py
+          python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+          shellcheck scripts/*.sh
+
+      - name: Stage Unsigned Plugin And Parse Luau
+        run: |
+          python3 scripts/build-plugin.py --wait 0 --output dist/ci
+          find plugin/iskra -type f \( -name '*.luau' -o -name '*.lua' \) \
+            ! -path '*/.assets.*' -print0 \
+            | sort -z | xargs -0 -r luau-compile --only-parse
+
+      # CI artifacts are not signed plugins or public GitHub Releases.
+      - name: Upload Unsigned Plugin Artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: iskra-unsigned-plugin-${{ github.run_id }}
+          path: dist/ci/
+          if-no-files-found: error
+          retention-days: 7
+
+  rust-check:
+    name: Linux Rust checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     env:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: "0"
       # The pinned C library is installed outside the distro linker paths.
       RUSTFLAGS: "-L native=/usr/local/lib"
-      SOURCE_DATE_EPOCH: "946684800"
-      LUAU_COMMIT: 12a6ba75883272c79b66b59815efef4c574196f6
       LAYER_SHELL_COMMIT: 536ff516ed68b9bb34afc4c07f942a54b2b4b03f
     defaults:
       run:
@@ -29,7 +125,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
-            build-essential cmake curl pkg-config lua5.4 python3 python3-pil shellcheck meson ninja-build \
+            build-essential curl pkg-config meson ninja-build \
             libgtk-4-dev libwayland-dev wayland-protocols \
             libgdk-pixbuf-2.0-dev libcairo2-dev
           rustup toolchain install 1.96.0 --profile minimal --component rustfmt,clippy
@@ -54,27 +150,6 @@ jobs:
           sudo meson install -C "$source_dir/build"
           sudo ldconfig
 
-      - name: Build Pinned Luau Compiler
-        run: |
-          source_dir="$RUNNER_TEMP/iskra-luau"
-          mkdir -p "$source_dir"
-          curl --fail --location --retry 3 \
-            "https://github.com/luau-lang/luau/archive/$LUAU_COMMIT.tar.gz" \
-            -o "$RUNNER_TEMP/iskra-luau.tar.gz"
-          tar -xzf "$RUNNER_TEMP/iskra-luau.tar.gz" \
-            --strip-components=1 -C "$source_dir"
-          cmake -S "$source_dir" -B "$source_dir/build" \
-            -DCMAKE_BUILD_TYPE=Release -DLUAU_BUILD_TESTS=OFF -DLUAU_BUILD_WEB=OFF
-          cmake --build "$source_dir/build" --target Luau.Compile.CLI --parallel 2
-          echo "$source_dir/build" >> "$GITHUB_PATH"
-
-      - name: Check Workflow Syntax
-        run: |
-          curl --fail --location --retry 3 https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz -o "$RUNNER_TEMP/actionlint.tar.gz"
-          mkdir "$RUNNER_TEMP/actionlint"
-          tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP/actionlint"
-          "$RUNNER_TEMP/actionlint/actionlint" .github/workflows/*.yml
-
       - name: Fetch Locked Rust Dependencies
         run: cargo fetch --locked
 
@@ -84,22 +159,57 @@ jobs:
           cargo test --offline --locked
           cargo clippy --offline --locked --all-targets -- -D warnings
 
-      - name: Check Plugin And Packaging
-        run: |
-          lua5.4 plugin/iskra/tests/model_test.lua
-          lua5.4 plugin/iskra/tests/i18n_test.lua
-          python3 plugin/iskra/tests/locales_test.py
-          python3 -m unittest discover -s scripts/tests -p 'test_*.py'
-          shellcheck scripts/*.sh
-          cargo install cargo-audit --locked --version 0.23.0
-          cargo audit --deny warnings
+  native-package:
+    name: Linux native package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      # The pinned C library is installed outside the distro linker paths.
+      RUSTFLAGS: "-L native=/usr/local/lib"
+      SOURCE_DATE_EPOCH: "946684800"
+      LAYER_SHELL_COMMIT: 536ff516ed68b9bb34afc4c07f942a54b2b4b03f
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check Out Sources
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
-      - name: Stage Unsigned Plugin And Parse Luau
+      - name: Install Build Dependencies
         run: |
-          python3 scripts/build-plugin.py --wait 0 --output dist/ci
-          find plugin/iskra -type f \( -name '*.luau' -o -name '*.lua' \) \
-            ! -path '*/.assets.*' -print0 \
-            | sort -z | xargs -0 -r luau-compile --only-parse
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential curl pkg-config python3 python3-pil meson ninja-build \
+            libgtk-4-dev libwayland-dev wayland-protocols \
+            libgdk-pixbuf-2.0-dev libcairo2-dev
+          rustup toolchain install 1.96.0 --profile minimal
+          rustup default 1.96.0
+          rustc --version
+          cargo --version
+
+      - name: Build Pinned GTK4 Layer Shell
+        run: |
+          source_dir="$RUNNER_TEMP/iskra-layer-shell"
+          mkdir -p "$source_dir"
+          curl --fail --location --retry 3 \
+            "https://github.com/wmww/gtk4-layer-shell/archive/$LAYER_SHELL_COMMIT.tar.gz" \
+            -o "$RUNNER_TEMP/iskra-layer-shell.tar.gz"
+          tar -xzf "$RUNNER_TEMP/iskra-layer-shell.tar.gz" \
+            --strip-components=1 -C "$source_dir"
+          meson setup "$source_dir/build" "$source_dir" \
+            --prefix=/usr/local --libdir=lib \
+            -Dexamples=false -Ddocs=false -Dtests=false -Dsmoke-tests=false \
+            -Dintrospection=false -Dvapi=false
+          meson compile -C "$source_dir/build"
+          sudo meson install -C "$source_dir/build"
+          sudo ldconfig
+
+      - name: Fetch Locked Rust Dependencies
+        run: cargo fetch --locked
 
       - name: Build Desktop Companion Without Launching
         run: |
@@ -116,7 +226,7 @@ jobs:
           sha256sum iskra-desktop-*-linux-x86_64.tar.gz zeron-pet-bar-linux-x86_64 > SHA256SUMS
 
       # CI artifacts are not signed plugins or public GitHub Releases.
-      - name: Upload Unsigned Build Artifacts
+      - name: Upload Unsigned Native Artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: iskra-unsigned-linux-x86_64-${{ github.run_id }}
