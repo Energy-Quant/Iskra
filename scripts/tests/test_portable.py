@@ -161,11 +161,63 @@ class DeliveryTests(unittest.TestCase):
                 module('release-control').unzip(archive, root / 'dest')
             self.assertFalse((root / 'escape').exists())
 
+    def release_fixture(self, operation, branch, sha, run_attempt=3, jobs=()):
+        release = module('release-control')
+        run = {'id': 99, 'run_attempt': run_attempt, 'head_sha': sha, 'conclusion': 'success',
+               'head_branch': branch, 'head_repository': {'full_name': 'Energy-Quant/Iskra'},
+               'event': 'push', 'path': '.github/workflows/ci.yml', 'html_url': 'https://example.test/run'}
+        seen = []
+
+        def fake_api(path):
+            if path == 'repos/Energy-Quant/Iskra/actions/runs/99':
+                return run
+            if path == f'repos/Energy-Quant/Iskra/git/ref/heads/{branch}':
+                return {'object': {'sha': sha}}
+            if path == 'repos/Energy-Quant/Iskra/git/ref/heads/main':
+                return {'object': {'sha': sha if operation == 'nightly' else 'm' * 40}}
+            raise AssertionError(path)
+
+        def fake_api_all(path, key=None):
+            seen.append(path)
+            if path == f'repos/Energy-Quant/Iskra/actions/workflows/ci.yml/runs?branch={branch}&per_page=100':
+                return [run]
+            if path == f'repos/Energy-Quant/Iskra/actions/runs/99/attempts/{run_attempt}/jobs?per_page=100':
+                return list(jobs)
+            raise AssertionError(path)
+
+        return release, seen, fake_api, fake_api_all
+
+    def test_nightly_skips_exact_main_synced_dev_before_download(self):
+        sha = 'd' * 40
+        release, seen, fake_api, fake_api_all = self.release_fixture('nightly', 'dev', sha)
+        with patch.object(release, 'api', side_effect=fake_api), \
+                patch.object(release, 'api_all', side_effect=fake_api_all), \
+                patch.object(release, 'gh') as gh, \
+                patch.object(sys, 'argv', ['release-control.py', 'nightly', '--run', '99']):
+            release.main()
+        gh.assert_not_called()
+        self.assertFalse(any('/jobs?' in path for path in seen))
+
+    def test_ci_gate_attempt_job_must_match_source_head_sha(self):
+        sha = 'd' * 40
+        jobs = [{'name': 'CI Gate', 'conclusion': 'success', 'head_sha': 'e' * 40}]
+        release, seen, fake_api, fake_api_all = self.release_fixture('prepare', 'main', sha, run_attempt=3, jobs=jobs)
+        with patch.object(release, 'api', side_effect=fake_api), \
+                patch.object(release, 'api_all', side_effect=fake_api_all), \
+                patch.object(release, 'gh') as gh, \
+                patch.object(sys, 'argv', ['release-control.py', 'prepare', '--run', '99']), \
+                self.assertRaises(ValueError):
+            release.main()
+        self.assertIn('repos/Energy-Quant/Iskra/actions/runs/99/attempts/3/jobs?per_page=100', seen)
+        gh.assert_not_called()
+
     def test_rule_layers_keep_ci_from_bypassing_checks(self):
         configure = module('configure-repository')
         rules = {r['name']: r for r in configure.desired(123)}
         app = {'actor_id': 123, 'actor_type': 'Integration', 'bypass_mode': 'always'}
         self.assertEqual(rules['main-required-review-and-ci']['bypass_actors'], [])
+        pull_request = next(r for r in rules['main-required-review-and-ci']['rules'] if r['type'] == 'pull_request')
+        self.assertEqual(pull_request['parameters']['allowed_merge_methods'], ['merge'])
         self.assertEqual(rules['main-ci-updates-only']['bypass_actors'], [app])
         self.assertEqual(rules['dev-required-ci']['bypass_actors'], [app])
         self.assertEqual(rules['release-tags-ci-creation']['bypass_actors'], [app])
