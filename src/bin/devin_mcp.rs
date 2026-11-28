@@ -209,6 +209,152 @@ fn apply_hook_event(v: &Value, dir: &std::path::Path) -> Option<()> {
     Some(())
 }
 
+// ---- launch / install -------------------------------------------------------
+
+/// Pet executable next to this binary, if the pair is co-installed.
+fn pet_exe_beside(self_exe: &std::path::Path) -> Option<PathBuf> {
+    let dir = self_exe.parent()?;
+    let name = if cfg!(windows) {
+        "zeron-pet.exe"
+    } else {
+        "zeron-pet"
+    };
+    let p = dir.join(name);
+    p.is_file().then_some(p)
+}
+
+/// Fire-and-forget pet launch for hook contexts that cannot block: spawn
+/// the pet detached with ISKRA_ZERON pointing at this shim and return
+/// immediately. No probing and no readiness wait — a hook must never
+/// stall on asset loading. Redundant spawns self-neutralize: the pet is
+/// single-instance, a second no-args process forwards empty argv to the
+/// running instance and exits.
+fn launch_pet(self_exe: &std::path::Path) -> Result<(), String> {
+    let pet = pet_exe_beside(self_exe)
+        .ok_or_else(|| format!("zeron-pet not found beside {}", self_exe.display()))?;
+    zeron_pet::launcher::spawn_detached_env(&pet, &[], &[("ISKRA_ZERON", self_exe)])
+        .map(|_child| ())
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Hook shell command invoking this binary: quoted path plus subcommand.
+fn hook_command(self_exe: &std::path::Path, sub: &str) -> String {
+    format!("\"{}\" {sub}", self_exe.display())
+}
+
+/// Devin CLI config path: %APPDATA%\devin\config.json on Windows,
+/// ~/.config/devin/config.json elsewhere.
+fn devin_config_path() -> PathBuf {
+    #[cfg(windows)]
+    if let Some(roaming) = std::env::var_os("APPDATA") {
+        return PathBuf::from(roaming).join("devin").join("config.json");
+    }
+    zeron_pet::paths::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".config")
+        .join("devin")
+        .join("config.json")
+}
+
+/// Events that simply mirror session state, plus SessionStart which also
+/// launches the pet. Values are (event, needs_matcher, subcommands).
+fn hook_plan() -> [(&'static str, bool, &'static [&'static str]); 6] {
+    [
+        ("SessionStart", false, &["hook", "launch"]),
+        ("UserPromptSubmit", false, &["hook"]),
+        ("Stop", false, &["hook"]),
+        ("SessionEnd", false, &["hook"]),
+        ("PermissionRequest", false, &["hook"]),
+        ("PreToolUse", true, &["hook"]),
+    ]
+}
+
+/// Merge the shim's hook entries into an existing hooks object,
+/// idempotently: a command invoking this binary with the same subcommand
+/// is already present anywhere in the event array counts as installed.
+fn merge_hooks(hooks: &mut Value, self_exe: &std::path::Path) {
+    let marker = "zeron-pet-devin-mcp";
+    let Some(root) = hooks.as_object_mut() else {
+        return;
+    };
+    for (event, needs_matcher, subs) in hook_plan() {
+        let arr = match root
+            .entry(event)
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+        {
+            Some(arr) => arr,
+            None => continue,
+        };
+        let missing: Vec<Value> = subs
+            .iter()
+            .filter(|sub| {
+                !arr.iter().any(|entry| {
+                    entry
+                        .get("hooks")
+                        .and_then(Value::as_array)
+                        .is_some_and(|hs| {
+                            hs.iter().any(|h| {
+                                h.get("command")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|c| c.contains(marker) && c.ends_with(*sub))
+                            })
+                        })
+                })
+            })
+            .map(|sub| {
+                json!({
+                    "type": "command",
+                    "command": hook_command(self_exe, sub),
+                    "timeout": if *sub == "launch" { 10 } else { 5 },
+                })
+            })
+            .collect();
+        if missing.is_empty() {
+            continue;
+        }
+        let mut entry = json!({ "hooks": missing });
+        if needs_matcher {
+            entry["matcher"] = json!("");
+        }
+        arr.push(entry);
+    }
+}
+
+/// Install hook entries into the Devin CLI config, preserving everything
+/// else. Refuses to touch an unparsable existing config.
+fn install_config(self_exe: &std::path::Path, path: &std::path::Path) -> Result<String, String> {
+    let mut cfg: Value = match std::fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| {
+            format!(
+                "{}: unparsable existing config, not touching it: {e}",
+                path.display()
+            )
+        })?,
+        Err(_) => json!({}),
+    };
+    if !cfg.is_object() {
+        return Err(format!("{}: config root is not an object", path.display()));
+    }
+    if cfg.get("hooks").is_none() {
+        cfg["hooks"] = json!({});
+    }
+    if !cfg["hooks"].is_object() {
+        return Err(format!("{}: 'hooks' is not an object", path.display()));
+    }
+    merge_hooks(&mut cfg["hooks"], self_exe);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    }
+    // Atomic write: a session reading the config mid-write never sees half.
+    let tmp = path.with_extension("json.tmp");
+    let body = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
+    std::fs::write(&tmp, body).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("rename over {}: {e}", path.display()))?;
+    Ok(format!("hooks installed into {}", path.display()))
+}
+
 fn main() {
     let dir = state_dir();
     match std::env::args().nth(1).as_deref() {
@@ -238,8 +384,27 @@ fn main() {
                 }
             }
         }
+        // Ensure the pet is running with this shim as its transport.
+        // Silent: runs inside SessionStart, hook stdout is meaningful.
+        Some("launch") => {
+            let exe = std::env::current_exe().unwrap_or_default();
+            if launch_pet(&exe).is_err() {
+                std::process::exit(1);
+            }
+        }
+        // One-time setup: merge hook entries into the Devin CLI config.
+        Some("install") => {
+            let exe = std::env::current_exe().unwrap_or_default();
+            match install_config(&exe, &devin_config_path()) {
+                Ok(msg) => println!("{msg}"),
+                Err(e) => {
+                    eprintln!("zeron-pet-devin-mcp install: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         _ => {
-            eprintln!("usage: zeron-pet-devin-mcp mcp|hook");
+            eprintln!("usage: zeron-pet-devin-mcp mcp|hook|launch|install");
             std::process::exit(2);
         }
     }
@@ -429,5 +594,120 @@ mod tests {
         .unwrap();
         let sc = &resp["result"]["structuredContent"];
         assert_eq!(sc["total"].as_u64(), Some(2));
+    }
+
+    fn shim() -> PathBuf {
+        PathBuf::from(if cfg!(windows) {
+            "C:\\pet\\zeron-pet-devin-mcp.exe"
+        } else {
+            "/opt/pet/zeron-pet-devin-mcp"
+        })
+    }
+
+    fn hook_commands(hooks: &Value, event: &str) -> Vec<String> {
+        hooks[event]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .flat_map(|e| {
+                        e["hooks"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|h| h["command"].as_str().map(str::to_owned))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn merge_hooks_installs_all_events_and_launch() {
+        let mut hooks = json!({});
+        merge_hooks(&mut hooks, &shim());
+        for event in [
+            "SessionStart",
+            "UserPromptSubmit",
+            "Stop",
+            "SessionEnd",
+            "PermissionRequest",
+            "PreToolUse",
+        ] {
+            let cmds = hook_commands(&hooks, event);
+            assert!(
+                cmds.iter().any(|c| c.ends_with("hook")),
+                "{event} missing hook command: {cmds:?}"
+            );
+        }
+        let start = hook_commands(&hooks, "SessionStart");
+        assert!(start.iter().any(|c| c.ends_with("launch")));
+        // PreToolUse carries the empty matcher; SessionStart must not.
+        let pre = &hooks["PreToolUse"][0];
+        assert_eq!(pre["matcher"].as_str(), Some(""));
+        assert!(hooks["SessionStart"][0].get("matcher").is_none());
+    }
+
+    #[test]
+    fn merge_hooks_is_idempotent_and_preserves_foreign_entries() {
+        let mut hooks = json!({
+            "SessionStart": [
+                { "hooks": [{ "type": "command", "command": "echo mine", "timeout": 3 }] }
+            ]
+        });
+        merge_hooks(&mut hooks, &shim());
+        let count_before = hooks["SessionStart"].as_array().unwrap().len();
+        merge_hooks(&mut hooks, &shim());
+        assert_eq!(
+            hooks["SessionStart"].as_array().unwrap().len(),
+            count_before
+        );
+        let cmds = hook_commands(&hooks, "SessionStart");
+        assert!(cmds.iter().any(|c| c == "echo mine"));
+    }
+
+    #[test]
+    fn install_config_preserves_top_level_keys() {
+        let dir = state_fixture();
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            json!({ "local_tools_bypass_permissions": true, "hooks": {} }).to_string(),
+        )
+        .unwrap();
+        let msg = install_config(&shim(), &path).unwrap();
+        assert!(msg.contains("hooks installed"));
+        let cfg: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(cfg["local_tools_bypass_permissions"].as_bool(), Some(true));
+        assert!(hook_commands(&cfg["hooks"], "SessionStart")
+            .iter()
+            .any(|c| c.ends_with("launch")));
+    }
+
+    #[test]
+    fn install_config_refuses_unparsable_file() {
+        let dir = state_fixture();
+        let path = dir.join("config.json");
+        std::fs::write(&path, "not json{").unwrap();
+        assert!(install_config(&shim(), &path).is_err());
+        // Untouched.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json{");
+    }
+
+    #[test]
+    fn pet_exe_resolution() {
+        let dir = state_fixture();
+        let fake_shim = dir.join(if cfg!(windows) {
+            "zeron-pet-devin-mcp.exe"
+        } else {
+            "zeron-pet-devin-mcp"
+        });
+        assert!(pet_exe_beside(&fake_shim).is_none());
+        let pet = dir.join(if cfg!(windows) {
+            "zeron-pet.exe"
+        } else {
+            "zeron-pet"
+        });
+        std::fs::write(&pet, b"x").unwrap();
+        assert_eq!(pet_exe_beside(&fake_shim), Some(pet));
     }
 }

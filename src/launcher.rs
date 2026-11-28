@@ -357,7 +357,17 @@ fn read_capped(path: &Path) -> String {
 /// hold the caller's pipes open), a fresh session via setsid on unix /
 /// DETACHED_PROCESS + own process group on Windows, argv passed without a
 /// shell so values are preserved byte-for-byte.
-fn spawn_detached(executable: &Path, forwarded_args: &[String]) -> Result<Child, String> {
+pub fn spawn_detached(executable: &Path, forwarded_args: &[String]) -> Result<Child, String> {
+    spawn_detached_env(executable, forwarded_args, &[])
+}
+
+/// `spawn_detached` with extra environment variables for the child; the
+/// rest of the inherited environment is untouched.
+pub fn spawn_detached_env(
+    executable: &Path,
+    forwarded_args: &[String],
+    envs: &[(&str, &Path)],
+) -> Result<Child, String> {
     #[cfg(windows)]
     use std::os::windows::process::CommandExt;
     #[cfg(windows)]
@@ -370,6 +380,9 @@ fn spawn_detached(executable: &Path, forwarded_args: &[String]) -> Result<Child,
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
     #[cfg(unix)]
     unsafe {
         // AUDIT: pre_exec runs between fork and exec in the child, where

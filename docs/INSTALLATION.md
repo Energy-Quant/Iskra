@@ -50,6 +50,27 @@ count. Control flags (`--status`, `--pause`, `--click-through on|off`,
 `--quit`) forward over the named pipe to the running instance, same as on
 Wayland.
 
+### Devin CLI status bridge (Windows)
+
+`zeron-pet-devin-mcp` is a second small binary that feeds the pet the
+live status of local Devin CLI/Desktop sessions instead of a Zeron
+transport. Build it with the same toolchain, then place both executables
+and the `assets/` directory in one folder. One-time setup:
+
+```powershell
+cargo +1.96.0-x86_64-pc-windows-gnullvm build --release --bin zeron-pet-devin-mcp
+# copy zeron-pet.exe, zeron-pet-devin-mcp.exe and assets\ into one folder, then:
+.\zeron-pet-devin-mcp.exe install
+```
+
+`install` merges lifecycle hook entries into the Devin config
+(`%APPDATA%\devin\config.json`) without touching other keys and is
+idempotent. From then on every session start launches the pet (single
+instance — parallel sessions share it), and the pet mirrors session
+state: working while the agent acts, a question pose on permission and
+input prompts, joy when a turn completes. Uninstall by removing the
+`zeron-pet-devin-mcp` hook entries from the config.
+
 ## Nightly channel
 
 `nightly-<commit>-<run>` releases are CI-only, immutable prereleases from
