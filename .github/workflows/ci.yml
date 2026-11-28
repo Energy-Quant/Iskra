@@ -9,20 +9,43 @@ permissions:
   contents: read
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   policy:
     name: Branch policy
     runs-on: ubuntu-24.04
+    outputs:
+      sync_skip: ${{ steps.sync.outputs.skip }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
           fetch-depth: 0
       - run: python3 scripts/branch-policy.py
+      - name: Detect exact main-synced dev fast-forward
+        id: sync
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref }}
+          REPO_NAME: ${{ github.repository }}
+        run: |
+          skip=false
+          if [ "$EVENT_NAME" = "push" ] && [ "$REF_NAME" = "refs/heads/dev" ] && [ "$REPO_NAME" = "Energy-Quant/Iskra" ]; then
+            head_sha="$(git rev-parse --verify -q HEAD || true)"
+            main_sha="$(git rev-parse --verify -q refs/remotes/origin/main || true)"
+            if [ -n "$head_sha" ] && [ "$head_sha" = "$main_sha" ]; then
+              skip=true
+              echo "Exact commit SHA matches refs/remotes/origin/main ($head_sha); skipping duplicate dev sync build."
+            fi
+          fi
+          echo "skip=$skip" >> "$GITHUB_OUTPUT"
   linux:
+    needs: [policy]
+    if: needs.policy.outputs.sync_skip != 'true'
     uses: ./.github/workflows/linux.yml
   portable:
+    needs: [policy]
+    if: needs.policy.outputs.sync_skip != 'true'
     name: Portable (${{ matrix.platform }})
     strategy:
       fail-fast: false
@@ -67,7 +90,8 @@ jobs:
           retention-days: 14
   contents:
     name: Artifact contract
-    needs: [linux, portable]
+    needs: [policy, linux, portable]
+    if: needs.policy.outputs.sync_skip != 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -79,7 +103,7 @@ jobs:
       - run: python3 scripts/check-artifacts.py dist/contracts
   gate:
     name: CI Gate
-    if: always()
+    if: always() && needs.policy.outputs.sync_skip != 'true'
     needs: [policy, linux, portable, contents]
     runs-on: ubuntu-24.04
     steps:
