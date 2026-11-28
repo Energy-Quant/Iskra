@@ -300,6 +300,9 @@ struct AppState {
     shown: bool,
     hud_shown: bool,
     ct_applied: bool,
+    /// (anim, frame index, x, y) of the last blit — unchanged frames are
+    /// not re-copied and re-presented every tick.
+    blit_key: Option<(String, usize, i32, i32)>,
     rx_z: mpsc::Receiver<zeron::EngineMsg>,
     rx_h: mpsc::Receiver<hyprland::HyprEvent>,
     rx_u: mpsc::Receiver<usage::UsageSnapshot>,
@@ -699,7 +702,7 @@ fn apply_click_through(st: &mut AppState, on: bool) {
     st.ct_applied = on;
 }
 
-/// One 60ms tick: drain channels, advance the shared state machine, then
+/// One tick: drain channels, advance the shared state machine, then
 /// apply its outputs to the two surfaces (frame, HUD, visibility,
 /// click-through) with no Shared borrow held.
 fn on_tick(st: &mut AppState) {
@@ -707,6 +710,7 @@ fn on_tick(st: &mut AppState) {
     let frame;
     let sprite_pos;
     let mut resized = false;
+    let mut blit_key;
     let display;
     let vis;
     {
@@ -722,7 +726,6 @@ fn on_tick(st: &mut AppState) {
                 st.hud_dirty = true;
             }
         }
-        frame = s.current_frame();
         sprite_pos = screen_pos(&s, (s.motion.x.round() as i32, s.motion.y.round() as i32));
         // Re-render the HUD whenever any drawn input changes.
         let key = format!(
@@ -735,8 +738,26 @@ fn on_tick(st: &mut AppState) {
             st.hud_key = key;
             st.hud_dirty = true;
         }
+        let mut force_blit = false;
         if let Some(p) = s.poll_assets() {
             resized = p.resized;
+            force_blit = true;
+        }
+        // Frame pixels are big; copy and present them only when the visible
+        // content actually changed (anim, frame index or position). The key
+        // is consumed only after a real blit below — while hidden the dirty
+        // state survives until the next visible present.
+        blit_key = Some((
+            s.current_anim.clone(),
+            s.frame_index(),
+            sprite_pos.0,
+            sprite_pos.1,
+        ));
+        if force_blit || st.blit_key != blit_key {
+            frame = s.current_frame();
+        } else {
+            frame = None;
+            blit_key = None;
         }
     }
     let show = vis == hyprland::Visibility::Visible;
@@ -759,6 +780,7 @@ fn on_tick(st: &mut AppState) {
     if show {
         if let Some(f) = &frame {
             blit_sprite(st, f, sprite_pos);
+            st.blit_key = blit_key.take();
         }
         if let (Some(pos), Some(dib)) = (hud_pos, st.hud_dib.as_ref()) {
             ulw(st.hud, pos, dib);
@@ -1471,6 +1493,7 @@ pub fn run(cli: Cli) -> i32 {
         shown: false,
         hud_shown: false,
         ct_applied: false,
+        blit_key: None,
         rx_z,
         rx_h,
         rx_u,
